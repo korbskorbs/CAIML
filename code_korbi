@@ -1,0 +1,247 @@
+---
+title: "CAIML_Group_Project"
+output: html_document
+date: "2022-11-14"
+---
+
+Content
+1. Set wd
+2. Get data and packages
+
+
+### 1. Set wd
+
+```{r}
+getwd()
+setwd("/Users/korbinianthiele/Desktop/CAIML")
+install.packages(c("mlr3verse", "parallel", "future", "mlr3learners", "glmnet", "ranger", "ggplot2", "patchwork", "readr", "MASS", "caTools", "rpart.plot", "paradox", "DALEXtra"))
+
+```
+
+### 2. Set data and packages
+
+Get data and relevant packages
+```{r}
+library(ggplot2)
+library(patchwork)
+library(readr)
+library(MASS)
+library(caTools)
+bank_data <- read.csv("data.csv", header = TRUE)
+bank_data
+summary(bank_data)
+na_count <-sapply(bank_data, function(y) sum(length(which(is.na(y)))))
+na_count
+#all of them have 0 NAs
+```
+
+
+We are using mlr3 for the creation of the task, to split the data and to define a pipeline object for imputation
+```{r}
+library(mlr3verse)
+
+#change "Bankrupt." to factor, to convert column from numeric to factor
+bank_data[, 'Bankrupt.'] <- as.factor(bank_data[, 'Bankrupt.']) 
+
+#set the task
+task_bank = TaskClassif$new(id = "bank", backend = bank_data, 
+  target = {"Bankrupt."}, positive = "1")
+
+#split the data
+splits = partition(task_bank, ratio = 0.75)
+print(str(splits))
+
+#define a pipeline object for imputation
+imputer = po("imputemedian") 
+```
+
+Create learner object
+```{r}
+tree = lrn("classif.rpart")
+tree = as_learner(imputer %>>% tree)
+```
+
+
+Train model and create confusion matrix of predictions
+```{r}
+tree$train(task = task_bank, splits$train)
+prediction = tree$predict(task_bank, splits$test)
+prediction$confusion
+```
+
+Analyse and plot the splits made by the model
+```{r}
+tree$model
+
+library(rpart.plot)
+rpart.plot(tree$model$classif.rpart$model)
+```
+
+Calculate misclassification error
+```{r}
+mes = msrs(c("classif.ce","classif.acc"))
+tree_perf = prediction$score(mes)
+tree_perf
+```
+
+As the classification error is nearly at 4%, we now use a rf model in order to reduce the ce
+## Random forest model 
+
+Implementation of random forest model
+```{r}
+rf = lrn("classif.ranger") 
+rf = as_learner(imputer %>>% rf) 
+```
+
+
+Train, evaluate and save predictions 
+```{r}
+rf$train(task = task_bank, splits$train)
+prediction = rf$predict(task_bank, splits$test)
+prediction$confusion
+
+rf_perf = prediction$score(mes)
+rf_perf
+```
+We can see, that the ce has reduced in comparison to a regular decision tree.
+
+Next, we have a look at cross validation in order tro further decrease the 
+Create a description of a 10 fold CV
+```{r}
+rdesc = rsmp("cv", folds = 10)
+```
+
+```{r}
+set.seed(2000)
+res = resample(learner = rf, task = task_bank, resampling = rdesc)
+res$aggregate(mes)
+```
+
+
+## Logistic regression
+
+```{r}
+#Set the task 
+bank_data[, 'Bankrupt.'] <- as.numeric(bank_data[, 'Bankrupt.']) 
+head(bank_data)
+task_bank_2 = as_task_regr(x = bank_data, id = "bank", target = "Bankrupt.", positive = "1")
+```
+
+```{r}
+
+regrBase = lrn("regr.featureless")
+mes = msrs(c("regr.rsq", "regr.mse"))
+regrBase$train(task = task_bank_2)
+prediction2 = regrBase$predict(task_bank_2)
+prediction2$score(mes)
+
+```
+
+### Regularization
+Since the data set contains over 90 independent variables, is could make sense to reduce the input of some of them or even delete some of them completely. We can do this by making use of  Ridge-Regression and LASSO-Regression
+
+We start with the LASSO regression
+First, we define a task
+```{r}
+bank_data_lasso <- read.csv("data.csv", header = TRUE)
+task_bank_3 = as_task_regr(x = bank_data, id = "bank_lasso", target = "Bankrupt.", positive = "1")
+
+lasso = lrn("regr.cv_glmnet", s = "lambda.min", alpha = 1) 
+lasso = as_learner(imputer %>>% lasso)
+
+res2 = resample(learner = lasso, task = task_bank_3, resampling = rdesc)
+res2$aggregate(mes)
+# autoplot(res2, measure = msr("regr.rsq"))
+```
+
+## Ridge Regression
+
+```{r}
+library(tidyverse)
+library(broom)
+library(glmnet)
+
+bank_data_ridge <- read.csv("data.csv", header = TRUE)
+head(bank_data_ridge)
+colnames(bank_data_ridge)
+y <- bank_data_ridge$Bankrupt.
+x <- bank_data_ridge %>% select(Operating.Profit.Rate, Pre.tax.net.Interest.Rate, Continuous.Net.Profit.Growth.Rate) %>% data.matrix()
+#glmnet generates default lambdas, we could tune them but we use the default ones 
+cv_fit <- cv.glmnet(x, y, alpha = 0)
+
+plot(cv_fit)
+
+```
+Permutation importance
+#todo -> change the measure from r squarred to misclassification error (ce)
+
+```{r}
+
+library(parallel)
+detectCores()
+cores = detectCores() - 1 # save one core to keep the computer operational
+library(future)
+
+plan("multisession", workers = cores)
+set.seed(2)
+
+bank_2 = read.csv("data.csv", header = TRUE)
+
+bank_task = as_task_regr(bank_2, target = "Bankrupt.", id = "Bankrupcy")
+
+fless = lrn("regr.featureless") 
+imputer = po("imputemedian")
+fless = as_learner(imputer %>>% fless)
+
+lm = lrn("regr.lm") 
+lm = as_learner(imputer %>>% lm)
+
+lasso = lrn("regr.cv_glmnet") 
+lasso = as_learner(imputer %>>% lasso)
+
+tree = lrn("regr.rpart") 
+tree = as_learner(imputer %>>% tree)
+
+rf = lrn("regr.ranger") 
+rf = as_learner(imputer %>>% rf)
+
+rdesc = rsmp("cv", folds = 3)
+
+design_regr_bank = benchmark_grid(
+  tasks = bank_task,
+  learners = list(fless, lm, lasso, tree, rf),
+  resamplings = rdesc)
+bm_regr_bank = benchmark(design_regr_bank)
+plan('sequential')
+autoplot(bm_regr_bank, measure = msr("regr.srho"))
+```
+
+From the best model, we try visualize variable importance measure 
+
+```{r}
+library(rpart.plot)
+library(mlr3verse)
+library(DALEXtra)
+library(ggplot2)
+
+rf$train(bank_task)
+
+bank_rf_exp <- explain_mlr3(rf, 
+  data = subset(bank_2, select = -c(Bankrupt.)),
+  y = bank_2$Bankrupt.,
+  predict_function_target_column = "Bankrupt.",
+  label = "ranger explainer ", colorize = FALSE)
+
+bank_varimp <- model_parts(bank_rf_exp, B = 10, N = nrow(bank_2),
+  type = "difference")
+bank_varimp
+
+ggplot(data=bank_varimp, aes(x=bank_rf_exp, y=)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_text(aes(label=len), vjust=-0.3, size=3.5)+
+  theme_minimal()
+```
+
+
+
+
